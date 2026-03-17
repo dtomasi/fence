@@ -3,10 +3,16 @@
 package sandbox
 
 import (
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -459,6 +465,110 @@ func TestLinux_NetworkBlocksDevTcp(t *testing.T) {
 	result := runUnderSandboxWithTimeout(t, cfg, "bash -c 'echo hi > /dev/tcp/127.0.0.1/80'", workspace, 10*time.Second)
 
 	assertBlocked(t, result)
+}
+
+// TestLinux_ExposedPortAllowsHostReachability verifies the library-based Linux
+// sandbox path can expose a localhost service back to the host.
+func TestLinux_ExposedPortAllowsHostReachability(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+	skipIfCommandNotFound(t, "python3")
+
+	features := DetectLinuxFeatures()
+	if !features.CanUnshareNet {
+		t.Skip("skipping: reverse bridge requires network namespace support")
+	}
+
+	workspace := createTempWorkspace(t)
+	cfg := testConfigWithWorkspace(workspace)
+	cfg.Network.AllowLocalBinding = true
+	markerName := "fence-exposed-port-marker.txt"
+	markerBody := "sandbox reverse bridge ok"
+	if err := os.WriteFile(filepath.Join(workspace, markerName), []byte(markerBody), 0o600); err != nil {
+		t.Fatalf("failed to create marker file: %v", err)
+	}
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+		},
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to allocate test port: %v", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		_ = listener.Close()
+
+		attemptErr := func() error {
+			manager := NewManager(cfg, false, false)
+			manager.SetExposedPorts([]int{port})
+			defer manager.Cleanup()
+
+			if err := manager.Initialize(); err != nil {
+				return fmt.Errorf("initialize sandbox manager: %w", err)
+			}
+
+			command := "python3 -m http.server " + strconv.Itoa(port) + " --bind 127.0.0.1"
+			wrappedCmd, err := manager.WrapCommand(command)
+			if err != nil {
+				return fmt.Errorf("wrap command: %w", err)
+			}
+
+			cmd := exec.Command("/bin/sh", "-c", wrappedCmd) //nolint:gosec // wrappedCmd is generated from trusted test input via the sandbox manager
+			cmd.Dir = workspace
+
+			var stdout, stderr strings.Builder
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			if err := cmd.Start(); err != nil {
+				return fmt.Errorf("start sandboxed server: %w", err)
+			}
+			defer func() {
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+				_ = cmd.Wait()
+			}()
+
+			url := "http://127.0.0.1:" + strconv.Itoa(port) + "/" + markerName
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				resp, err := client.Get(url)
+				if err == nil {
+					body, readErr := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					if readErr == nil && resp.StatusCode == http.StatusOK && string(body) == markerBody {
+						return nil
+					}
+					if readErr == nil {
+						lastErr = fmt.Errorf("unexpected response from exposed port %d: status=%d body=%q", port, resp.StatusCode, string(body))
+					} else {
+						lastErr = readErr
+					}
+				} else {
+					lastErr = err
+				}
+
+				if cmd.Process != nil && cmd.Process.Signal(syscall.Signal(0)) != nil {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			return fmt.Errorf("failed to reach sandboxed server via exposed port %d: %v\nstdout: %s\nstderr: %s", port, lastErr, stdout.String(), stderr.String())
+		}()
+		if attemptErr == nil {
+			return
+		}
+		lastErr = attemptErr
+	}
+
+	t.Fatalf("failed to reach sandboxed server after retries: %v", lastErr)
 }
 
 // TestLinux_ProxyAllowsAllowedDomains verifies the proxy allows configured domains.
