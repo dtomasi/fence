@@ -34,6 +34,27 @@
       },
       "type": "object"
     },
+    "devices": {
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "items": {
+            "pattern": "^/dev/.+",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "enum": [
+            "auto",
+            "minimal",
+            "host"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "extends": {
       "type": "string"
     },
