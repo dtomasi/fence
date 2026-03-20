@@ -30,6 +30,19 @@ Some coding agents and platforms ship sandboxing (Seatbelt/Landlock/etc.). Fence
 - **Defense-in-depth**: wrap an agent (or its subprocesses) with an additional layer and clearer audit signals.
 - **Practical allowlisting**: start with default-deny egress and use `-m` to discover what domains a workflow actually needs.
 
+## Fence's lane
+
+Fence should stay lightweight: built on process-level primitives like macOS
+`sandbox-exec` and Linux `bubblewrap`, focused on filesystem, network, and
+command policy.
+
+It is not trying to become a container or VM runtime, a protocol-specific
+filter, or a resource-limiting system. If you need stronger isolation or
+CPU/RAM/disk controls, use tools designed for that job, such as
+[Firecracker](https://firecracker-microvm.github.io/),
+[gVisor](https://gvisor.dev/), or
+[Kata Containers](https://katacontainers.io/).
+
 ## Non-goals
 
 Fence is **not** a hardened containment boundary for actively malicious code.

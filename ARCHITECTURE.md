@@ -1,159 +1,251 @@
 # Architecture
 
-Fence restricts network, filesystem, and command access for arbitrary commands. It works by:
+Fence is a policy-driven wrapper for running semi-trusted commands. It does more
+than "run a command behind a proxy": the CLI or Go API resolves configuration,
+merges templates or imported settings, evaluates policy, starts local
+control-plane components, and then delegates enforcement to a platform-specific
+sandbox.
 
-1. **Blocking commands** via configurable deny/allow lists before execution
-2. **Intercepting network traffic** via HTTP/SOCKS5 proxies that filter by domain
-3. **Sandboxing processes** using OS-native mechanisms (macOS sandbox-exec, Linux bubblewrap)
-4. **Sanitizing environment** by stripping dangerous variables (LD_PRELOAD, DYLD_INSERT_LIBRARIES, etc.)
+At a high level, Fence has four layers:
+
+1. **Configuration resolution** - Load JSONC, templates, imports, and `extends`
+2. **Policy evaluation** - Network, filesystem, devices, commands, SSH, and PTY
+3. **Runtime orchestration** - Start proxies/bridges, choose shell, harden env
+4. **Platform enforcement** - macOS Seatbelt or Linux bubblewrap/Landlock/seccomp
 
 ```mermaid
 flowchart TB
-    subgraph Fence
-        Config["Config<br/>(JSON)"]
-        Manager
-        CmdCheck["Command<br/>Blocking"]
-        EnvSanitize["Env<br/>Sanitization"]
-        Sandbox["Platform Sandbox<br/>(macOS/Linux)"]
-        HTTP["HTTP Proxy<br/>(filtering)"]
-        SOCKS["SOCKS5 Proxy<br/>(filtering)"]
+    subgraph Inputs
+        CLI["CLI / Go API"]
+        Settings["Config File<br/>(JSONC)"]
+        Templates["Embedded Templates"]
+        Import["Imported Tool Settings"]
     end
 
-    Config --> Manager
-    Manager --> CmdCheck
-    CmdCheck --> EnvSanitize
-    EnvSanitize --> Sandbox
-    Manager --> HTTP
-    Manager --> SOCKS
+    subgraph Fence
+        Resolve["Resolve Config<br/>(load, validate, extends)"]
+        Policy["Policy Model<br/>(network, fs, devices,<br/>command, ssh, pty)"]
+        Manager["Manager"]
+        Checks["Preflight Checks<br/>(command + ssh)"]
+        Runtime["Runtime Setup<br/>(proxies, bridges,<br/>shell, exec deny)"]
+        Env["Env Sanitization"]
+        Sandbox["Platform Sandbox<br/>(macOS/Linux)"]
+        Monitor["Violation Monitoring"]
+    end
+
+    CLI --> Resolve
+    Settings --> Resolve
+    Templates --> Resolve
+    Import --> Resolve
+    Resolve --> Policy
+    Policy --> Manager
+    Manager --> Checks
+    Manager --> Runtime
+    Runtime --> Env
+    Env --> Sandbox
+    Sandbox --> Monitor
 ```
 
 ## Project Structure
 
 ```text
 fence/
-├── cmd/fence/           # CLI entry point
-│   └── main.go          # Includes --landlock-apply wrapper mode
-├── internal/            # Private implementation
-│   ├── config/          # Configuration loading/validation
-│   ├── platform/        # OS detection
-│   ├── proxy/           # HTTP and SOCKS5 filtering proxies
-│   └── sandbox/         # Platform-specific sandboxing
-│       ├── manager.go   # Orchestrates sandbox lifecycle
-│       ├── macos.go     # macOS sandbox-exec profiles
-│       ├── linux.go     # Linux bubblewrap + socat bridges
-│       ├── linux_seccomp.go    # Seccomp BPF syscall filtering
-│       ├── linux_landlock.go   # Landlock filesystem control
-│       ├── linux_ebpf.go       # eBPF violation monitoring
-│       ├── linux_features.go   # Kernel feature detection
-│       ├── linux_*_stub.go     # Non-Linux build stubs
-│       ├── monitor.go   # macOS log stream violation monitoring
-│       ├── command.go   # Command blocking/allow lists
-│       ├── hardening.go # Environment sanitization
-│       ├── dangerous.go # Protected file/directory lists
-│       ├── shell.go     # Shell quoting utilities
-│       └── utils.go     # Path normalization
-└── pkg/fence/           # Public Go API
-    └── fence.go
+├── cmd/fence/                  # CLI entry point and runtime helpers
+│   ├── main.go                 # Main CLI, config/import/completion commands
+│   ├── pty_runtime_linux.go    # Linux PTY + signal relay for interactive sessions
+│   └── pty_runtime_stub.go     # Non-Linux PTY stub
+├── internal/                   # Private implementation
+│   ├── config/                 # Config types, loading, validation, file formatting
+│   ├── configschema/           # JSON Schema generation
+│   ├── importer/               # Import external tool settings into fence config
+│   ├── platform/               # OS detection and support helpers
+│   ├── proxy/                  # HTTP and SOCKS5 filtering proxies
+│   ├── templates/              # Embedded built-in config templates
+│   └── sandbox/                # Policy enforcement and platform-specific wrapping
+│       ├── manager.go          # Owns proxies, bridges, shell options, cleanup
+│       ├── command.go          # Command parsing, deny/allow rules, SSH policy
+│       ├── runtime_exec_deny.go # Exec-time blocking for selected denied executables
+│       ├── sanitize.go         # Environment sanitization
+│       ├── dangerous.go        # Mandatory dangerous file/directory protection
+│       ├── shell.go            # Shell quoting helpers
+│       ├── shell_select.go     # Shell selection / validation
+│       ├── macos.go            # macOS sandbox-exec profile generation
+│       ├── linux.go            # Linux bubblewrap wrapper generation
+│       ├── linux_landlock.go   # Landlock filesystem enforcement
+│       ├── linux_seccomp.go    # Seccomp BPF generation
+│       ├── linux_ebpf.go       # eBPF monitoring
+│       ├── linux_features.go   # Kernel/environment feature detection
+│       └── monitor.go          # macOS log stream monitoring
+├── pkg/fence/                  # Public Go API
+├── docs/schema/                # Published JSON schema
+└── tools/generate-config-schema/ # Schema generator entry point
 ```
 
-## Core Components
+## Core Layers
 
-### Config (`internal/config/`)
+### CLI And Public API (`cmd/fence/`, `pkg/fence/`)
 
-Handles loading and validating sandbox configuration:
+Fence can run as either a standalone CLI or an embeddable Go library.
+
+- `cmd/fence/main.go` handles the main execution flow plus `config init`,
+  `import`, `completion`, `--linux-features`, and the internal
+  `--landlock-apply` wrapper mode.
+- `pkg/fence` exposes config load/resolve/merge helpers and the sandbox manager
+  lifecycle so other Go programs can embed Fence directly.
+
+### Configuration Resolution (`internal/config/`, `internal/templates/`, `internal/importer/`)
+
+Fence's first architectural layer is config resolution: load inputs, validate
+them, merge inheritance, and only then build the runtime.
 
 ```go
 type Config struct {
-    Network    NetworkConfig    // Domain allow/deny lists
-    Filesystem FilesystemConfig // Read/write restrictions
-    Command    CommandConfig    // Command deny/allow lists
-    AllowPty   bool             // Allow pseudo-terminal allocation
+    Extends    string           // Base template or config file
+    Network    NetworkConfig    // Domains, localhost controls, proxy ports, Unix sockets
+    Filesystem FilesystemConfig // Read/write/execute restrictions
+    Devices    DevicesConfig    // Linux /dev policy
+    Command    CommandConfig    // Local command rules
+    SSH        SSHConfig        // SSH host / remote command rules
+    AllowPty   bool             // Allow pseudo-terminal access
 }
 ```
 
-- Loads from the default config path (Linux: `$XDG_CONFIG_HOME/fence/fence.json`, typically `~/.config/fence/fence.json`; macOS: `~/.config/fence/fence.json`) or a custom path
-- Falls back to restrictive defaults (block all network, default command deny list)
-- Validates paths and normalizes them
+- Config files support JSONC.
+- CLI source precedence is: `--template`, then `--settings`, then the resolved
+  default config path.
+- The default load path prefers `~/.config/fence/fence.json`; older installs
+  can still fall back to legacy paths when those files exist.
+- `extends` can refer to an embedded template or another config file. Fence
+  resolves inheritance before execution.
+- Merge behavior is config-aware: list fields append and dedupe, boolean feature
+  flags usually OR together, and scalar override fields (for example proxy
+  ports or device mode) let the child win.
+- `fence import` translates external settings into Fence config (currently
+  Claude Code settings), typically layering the imported rules on top of a base
+  template such as `code`.
+- `internal/configschema` generates the JSON schema published at
+  `docs/schema/fence.schema.json`.
 
-### Platform (`internal/platform/`)
+### Policy Model
 
-Simple OS detection:
+#### Network Policy
 
-```go
-func Detect() Platform  // Returns MacOS, Linux, Windows, or Unknown
-func IsSupported() bool // True for MacOS and Linux
-```
+- `allowedDomains` and `deniedDomains` are enforced by local HTTP and SOCKS5
+  proxies. Deny rules win.
+- Domain matching supports exact values such as `example.com` and wildcard
+  prefixes such as `*.example.com`.
+- `allowLocalBinding` and `allowLocalOutbound` are separate controls: binding
+  to localhost is not the same as connecting out to localhost services.
+- On macOS, Unix socket access can be allowlisted with `allowUnixSockets` or
+  fully opened with `allowAllUnixSockets`.
+- `allowedDomains: ["*"]` enables relaxed direct-network mode. Fence still
+  configures proxies for proxy-aware clients, but the sandbox stops relying on
+  forced proxy-only routing. In that mode, `deniedDomains` only applies to
+  traffic that actually goes through the proxy.
 
-### Proxy (`internal/proxy/`)
+#### Filesystem Policy
 
-Two proxy servers that filter traffic by domain:
+- Reads can run in either the normal "read mostly" mode or the stricter
+  `defaultDenyRead` mode.
+- Fence exposes three read/write tiers:
+  - `allowExecute` for tightly scoped executable paths
+  - `allowRead` for readable/listable paths
+  - `allowWrite` for writable paths (which also implies read/execute)
+- `denyRead` masks files or directories even if broader allow rules exist.
+- `denyWrite` turns specific paths back into read-only.
+- Fence also applies mandatory dangerous-path protection independent of user
+  config. This protects high-risk targets such as shell startup files, nested
+  `.git/hooks`, some editor config directories, and some agent config
+  directories.
+- `allowGitConfig` is a narrow escape hatch for `.git/config`.
+
+#### Command And SSH Policy
+
+- Local commands are checked before execution against default deny rules and any
+  user-defined deny/allow prefixes.
+- The parser understands `&&`, `||`, `;`, pipes, and nested `sh -c` / `bash -c`
+  patterns, so command chains do not bypass policy.
+- SSH is a first-class policy surface. Fence can separately enforce
+  `ssh.allowedHosts`, `ssh.deniedHosts`, `ssh.allowedCommands`,
+  `ssh.deniedCommands`, `ssh.allowAllCommands`, and `ssh.inheritDeny`.
+- Some single-token denied executables are also blocked at runtime by denying
+  the resolved binary path inside the sandbox. This prevents wrapper processes
+  from launching denied child executables after the initial preflight check.
+
+#### Devices And Interactive Execution
+
+- On Linux, `devices.mode` controls how `/dev` is exposed: `auto`, `minimal`,
+  or `host`.
+- `devices.allow` passes through specific `/dev/...` paths when using a minimal
+  `/dev`.
+- Fence uses deterministic `bash` by default, or a validated absolute `$SHELL`
+  in user-shell mode.
+- `allowPty` enables pseudo-terminal access in the sandboxed process.
+- On Linux, the CLI has a PTY runtime helper that relays resize and signal
+  events so TUIs continue to behave under `bwrap --new-session`.
+
+### Proxy Layer (`internal/proxy/`)
+
+Fence runs two local proxies and applies the same domain filter to both.
 
 #### HTTP Proxy (`http.go`)
 
-- Handles HTTP and HTTPS (via CONNECT tunneling)
-- Extracts domain from Host header or CONNECT request
-- Returns 403 for blocked domains
-- Listens on random available port
+- Handles HTTP and HTTPS via CONNECT tunneling
+- Extracts host/port from the request and returns `403` for blocked destinations
+- Listens on a random or configured localhost port
 
 #### SOCKS5 Proxy (`socks.go`)
 
 - Uses `github.com/things-go/go-socks5`
-- Handles TCP connections (git, ssh, etc.)
-- Same domain filtering logic as HTTP proxy
-- Listens on random available port
+- Handles generic TCP clients such as git, ssh, and other tools that honor
+  `ALL_PROXY`
+- Applies the same allow/deny filter as the HTTP proxy
 
-**Domain Matching:**
-
-- Exact match: `example.com`
-- Wildcard prefix: `*.example.com` (matches `api.example.com`)
-- Deny takes precedence over allow
-
-### Sandbox (`internal/sandbox/`)
+### Runtime Orchestration (`internal/sandbox/manager.go`)
 
 #### Manager (`manager.go`)
 
-Orchestrates the sandbox lifecycle:
+The manager owns the resolved config and the local runtime components needed to
+execute a sandboxed command:
 
-1. Initializes HTTP and SOCKS proxies
-2. Sets up platform-specific bridges (Linux)
-3. Checks command against deny/allow lists
-4. Wraps commands with sandbox restrictions
-5. Handles cleanup on exit
+1. Build a domain filter from the resolved config
+2. Start HTTP and SOCKS proxies
+3. On Linux, create outbound `socat` bridges and optional reverse bridges
+4. Validate shell options and exposed ports
+5. Run preflight command and SSH policy checks
+6. Generate a platform-specific wrapper command
+7. Clean up proxies, sockets, and helper processes on exit
 
-#### Command Blocking (`command.go`)
+### Environment Sanitization (`internal/sandbox/sanitize.go`)
 
-Blocks commands before they run based on configurable policies:
+Fence strips dangerous dynamic-loader environment variables before execution:
 
-- **Default deny list**: Dangerous system commands (`shutdown`, `reboot`, `mkfs`, `rm -rf`, etc.)
-- **Custom deny/allow**: User-configured prefixes (e.g., `git push`, `npm publish`)
-- **Chain detection**: Parses `&&`, `||`, `;`, `|` to catch blocked commands in pipelines
-- **Nested shells**: Detects `bash -c "blocked_cmd"` patterns
+- Linux: `LD_*`
+- macOS: `DYLD_*`
 
-#### Environment Sanitization (`hardening.go`)
+This prevents library injection attacks where a sandboxed process writes a
+malicious `.so` / `.dylib` and then uses `LD_PRELOAD` /
+`DYLD_INSERT_LIBRARIES` in a subsequent command. The same sanitization is also
+applied inside the Linux Landlock wrapper before the final `exec`.
 
-Strips dangerous environment variables before command execution:
+## Platform Enforcement
 
-- Linux: `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, etc.
-- macOS: `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, etc.
+### macOS Implementation (`macos.go`)
 
-This prevents library injection attacks where a sandboxed process writes a malicious `.so`/`.dylib` and uses `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES` in a subsequent command.
-
-#### macOS Implementation (`macos.go`)
-
-Uses Apple's `sandbox-exec` with Seatbelt profiles:
+Fence uses Apple's `sandbox-exec` with dynamically generated Seatbelt profiles.
 
 ```mermaid
 flowchart LR
     subgraph macOS Sandbox
         CMD["User Command"]
         SE["sandbox-exec -p profile"]
-        ENV["Environment Variables<br/>HTTP_PROXY, HTTPS_PROXY<br/>ALL_PROXY, GIT_SSH_COMMAND"]
+        ENV["HTTP_PROXY / HTTPS_PROXY / ALL_PROXY"]
     end
 
     subgraph Profile Controls
-        NET["Network: deny except localhost"]
-        FS["Filesystem: read/write rules"]
-        PROC["Process: fork/exec permissions"]
+        NET["Network rules<br/>proxy-only or relaxed direct mode<br/>localhost + Unix socket controls"]
+        FS["Filesystem rules<br/>allow/deny + dangerous-path protection"]
+        PROC["Process rules<br/>fork/exec + optional PTY<br/>runtime exec deny"]
     end
 
     CMD --> SE
@@ -163,16 +255,20 @@ flowchart LR
     SE -.-> PROC
 ```
 
-Seatbelt profiles are generated dynamically based on config:
+Seatbelt profiles are generated per command and encode:
 
-- `(deny default)` - deny all by default
-- `(allow network-outbound (remote ip "localhost:*"))` - only allow proxy
-- `(allow file-read* ...)` - selective file access
-- `(allow process-fork)`, `(allow process-exec)` - allow running programs
+- Proxy-only outbound mode by default, or relaxed direct-network mode when
+  `allowedDomains` contains `*`
+- `allowLocalBinding`, `allowLocalOutbound`, and optional Unix socket policy
+- Filesystem rules derived from `defaultDenyRead`, `allowRead`, `allowWrite`,
+  `denyRead`, `denyWrite`, and mandatory dangerous-path protection
+- `process-fork`, `process-exec`, runtime executable deny rules, and optional
+  PTY access
 
-#### Linux Implementation (`linux.go`)
+### Linux Implementation (`linux.go`)
 
-Uses `bubblewrap` (bwrap) with network namespace isolation:
+Fence uses `bubblewrap` with network namespace isolation when the environment
+supports it and the current policy needs forced proxy routing.
 
 ```mermaid
 flowchart TB
@@ -184,7 +280,7 @@ flowchart TB
         USOCK["Unix Sockets<br/>/tmp/fence-*.sock"]
     end
 
-    subgraph Sandbox ["Sandbox (bwrap --unshare-net)"]
+    subgraph Sandbox ["Sandbox (bwrap --unshare-net when available)"]
         CMD["User Command"]
         ISOCAT["socat :3128"]
         ISOCKS["socat :1080"]
@@ -202,18 +298,38 @@ flowchart TB
     CMD -.-> ENV2
 ```
 
-**Why socat bridges?**
+**Why `socat` bridges?**
 
-With `--unshare-net`, the sandbox has its own isolated network namespace - it cannot reach the host's network at all. Unix sockets provide filesystem-based IPC that works across namespace boundaries:
+When `--unshare-net` is active, the sandbox cannot reach the host network at
+all. Unix sockets provide filesystem-based IPC that works across namespace
+boundaries:
 
-1. Host creates Unix socket, connects to TCP proxy
-2. Socket file is bind-mounted into sandbox
-3. Sandbox's socat listens on localhost:3128, forwards to Unix socket
-4. Traffic flows: `sandbox:3128 → Unix socket → host proxy → internet`
+1. Host `socat` connects a Unix socket to the host-side proxy
+2. The Unix socket path is bind-mounted into the sandbox
+3. Sandbox `socat` listens on `127.0.0.1` and forwards to the shared socket
+4. Traffic flows: `sandbox localhost -> Unix socket -> host proxy -> internet`
+
+Linux enforcement also layers in:
+
+- Bubblewrap mount isolation for the base filesystem view
+- Optional `--unshare-net` isolation when available and not in relaxed
+  wildcard-network mode
+- Bind-mount allow/deny logic, explicit masking of denied paths, and mandatory
+  dangerous-path protection
+- Device shaping via `devices.mode`
+- Runtime executable denial by bind-masking selected binaries
+- Optional Landlock re-exec via the internal `--landlock-apply` wrapper
+- Optional seccomp and eBPF monitoring
+
+If the environment does not support network namespaces (common in some
+containers/CI setups), Fence can still configure proxies and filesystem policy,
+but direct-network isolation becomes a best-effort proxy-oriented fallback
+rather than a hard namespace boundary.
 
 ## Inbound Connections (Reverse Bridge)
 
-For servers running inside the sandbox that need to accept connections:
+On Linux, `-p/--port` exposes a server running inside the sandbox to the outside
+world when network namespace isolation is active.
 
 ```mermaid
 flowchart TB
@@ -231,76 +347,90 @@ flowchart TB
 
     EXT --> HSOCAT
     HSOCAT -->|UNIX-CONNECT| USOCK
-    USOCK <-->|shared via bind /| ISOCAT
+    USOCK <-->|shared via bind mount| ISOCAT
     ISOCAT --> APP
 ```
 
 Flow:
 
-1. Host socat listens on TCP port (e.g., 8888)
-2. Sandbox socat creates Unix socket, forwards to app
-3. External request → Host:8888 → Unix socket → Sandbox socat → App:8888
+1. Host `socat` listens on the requested TCP port
+2. A shared Unix socket links host and sandbox
+3. Sandbox `socat` forwards from the shared socket to the app
+4. Traffic flows: `outside -> host port -> shared socket -> sandbox app`
+
+If there is no isolated network namespace, a reverse bridge is unnecessary
+because the sandbox shares the host network directly.
 
 ## Execution Flow
 
 ```mermaid
 flowchart TD
-    A["1. CLI parses arguments"] --> B["2. Load config from XDG config dir"]
-    B --> C["3. Create Manager"]
-    C --> D["4. Manager.Initialize()"]
+    A["1. CLI/API receives command + options"] --> B["2. Resolve config source<br/>(template, settings file, or default path)"]
+    B --> C["3. Validate config and resolve extends"]
+    C --> D["4. Create Manager<br/>set ports + shell options"]
+    D --> E["5. Manager.Initialize()"]
 
-    D --> D1["Start HTTP proxy"]
-    D --> D2["Start SOCKS proxy"]
-    D --> D3["[Linux] Create socat bridges"]
-    D --> D4["[Linux] Create reverse bridges"]
+    E --> E1["Start HTTP proxy"]
+    E --> E2["Start SOCKS proxy"]
+    E --> E3["[Linux] Create outbound socat bridges"]
+    E --> E4["[Linux] Create reverse bridges if needed"]
 
-    D1 & D2 & D3 & D4 --> E["5. Manager.WrapCommand()"]
+    E1 & E2 & E3 & E4 --> F["6. Preflight checks"]
+    F --> F1{"Command and SSH policy ok?"}
+    F1 -->|blocked| ERR["Return error"]
+    F1 -->|allowed| G["7. Build platform wrapper"]
 
-    E --> E0{"Check command<br/>deny/allow lists"}
-    E0 -->|blocked| ERR["Return error"]
-    E0 -->|allowed| E1["[macOS] Generate Seatbelt profile"]
-    E0 -->|allowed| E2["[Linux] Generate bwrap command"]
+    G --> G1["[macOS] Generate Seatbelt profile"]
+    G --> G2["[Linux] Generate bwrap command<br/>+ optional Landlock wrapper"]
 
-    E1 & E2 --> F["6. Sanitize env<br/>(strip LD_*/DYLD_*)"]
-    F --> G["7. Execute wrapped command"]
-    G --> H["8. Manager.Cleanup()"]
-
-    H --> H1["Kill socat processes"]
-    H --> H2["Remove Unix sockets"]
-    H --> H3["Stop proxy servers"]
+    G1 & G2 --> H["8. Compute runtime exec denies<br/>and apply fs/device/network policy"]
+    H --> I["9. Sanitize environment<br/>(strip LD_*/DYLD_*)"]
+    I --> J["10. Execute command"]
+    J --> K["11. Monitor violations (optional)"]
+    K --> L["12. Cleanup proxies, sockets,<br/>and helper processes"]
 ```
 
 ## Platform Comparison
 
 | Feature | macOS | Linux |
 |---------|-------|-------|
-| Sandbox mechanism | sandbox-exec (Seatbelt) | bubblewrap + Landlock + seccomp |
-| Network isolation | Syscall filtering | Network namespace |
-| Proxy routing | Environment variables | socat bridges + env vars |
-| Filesystem control | Profile rules | Bind mounts + Landlock (5.13+) |
-| Syscall filtering | Implicit (Seatbelt) | seccomp BPF |
-| Inbound connections | Profile rules (`network-bind`) | Reverse socat bridges |
-| Violation monitoring | log stream + proxy | eBPF + proxy |
-| Env sanitization | Strips DYLD_* | Strips LD_* |
-| Requirements | Built-in | bwrap, socat |
+| Sandbox mechanism | `sandbox-exec` (Seatbelt) | `bubblewrap` + optional Landlock + seccomp |
+| Outbound network enforcement | Seatbelt outbound rules + proxies | Network namespace when available; proxy-oriented fallback otherwise |
+| Relaxed direct-network mode | `allowedDomains: ["*"]` allows direct outbound | `allowedDomains: ["*"]` skips `--unshare-net` |
+| Proxy routing | Environment variables | `socat` bridges + environment variables |
+| Filesystem control | Seatbelt read/write/exec rules | Bind mounts + deny masking + optional Landlock |
+| Device control | N/A | `devices.mode` + optional `/dev/...` passthrough |
+| Runtime exec deny | `deny process-exec` rules | Bind-mask selected executables |
+| Interactive PTY | Optional `pseudo-tty` permission | Optional PTY + CLI signal/resize relay |
+| Inbound connections | Local bind rules | Reverse `socat` bridges when using isolated netns |
+| Violation monitoring | `log stream` + proxy | eBPF + proxy |
+| Env sanitization | Strips `DYLD_*` | Strips `LD_*` |
+| Requirements | Built-in | `bwrap`, `socat` |
 
 ### Linux Security Layers
 
-On Linux, fence uses multiple security layers with graceful fallback:
+On Linux, Fence uses multiple security layers with graceful fallback:
 
-1. bubblewrap (core isolation via Linux namespaces)
-2. seccomp (syscall filtering)
-3. Landlock (filesystem access control)
-4. eBPF monitoring (violation visibility)
+1. `bubblewrap` (core isolation via Linux namespaces and mounts)
+2. `seccomp` (syscall filtering)
+3. `Landlock` (filesystem access control)
+4. `eBPF` monitoring (violation visibility)
+
+Not every environment exposes every feature. `linux_features.go` detects what
+is available and wrapper generation adapts to those capabilities.
 
 > [!NOTE]
-> Seccomp blocks syscalls silently (no logging). With `-m` and root/CAP_BPF, the eBPF monitor catches these failures by tracing syscall exits that return EPERM/EACCES.
+> Seccomp blocks syscalls silently (no logging). With `-m` and root/CAP_BPF,
+> the eBPF monitor catches these failures by tracing syscall exits that return
+> `EPERM` / `EACCES`.
 
 See [Linux Security Features](./docs/linux-security-features.md) for details.
 
 ## Violation Monitoring
 
-The `-m` (monitor) flag enables real-time visibility into blocked operations. These only apply to filesystem and network operations, not blocked commands.
+The `-m` (monitor) flag enables real-time visibility into blocked runtime
+operations. Preflight command and SSH blocks are returned as normal errors and
+do not depend on monitor mode.
 
 ### Output Prefixes
 
@@ -314,7 +444,8 @@ The `-m` (monitor) flag enables real-time visibility into blocked operations. Th
 
 ### macOS Log Stream
 
-On macOS, fence spawns `log stream` with a predicate to capture sandbox violations:
+On macOS, Fence spawns `log stream` with a predicate to capture sandbox
+violations:
 
 ```bash
 log stream --predicate 'eventMessage ENDSWITH "_SBX"' --style compact
@@ -344,4 +475,5 @@ Filtered out (too noisy):
 
 ## Security Model
 
-See [`docs/security-model.md`](docs/security-model.md) for Fence's threat model, guarantees, and limitations.
+See [`docs/security-model.md`](docs/security-model.md) for Fence's threat
+model, guarantees, and limitations.
