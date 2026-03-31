@@ -91,9 +91,19 @@ fence -t code -- claude  # Runs Claude Code using `code` template config
 # Monitor mode (shows violations)
 fence -m npm install
 
+# Inspect the config inheritance chain and active merged config
+fence config show
+
 # Show all commands and options
 fence --help
 ```
+
+> [!TIP]
+> Need to pass flags to the command you are running? Use `--` to separate Fence flags from command flags, for example:
+>
+> ```bash
+> fence -- claude --dangerously-skip-permissions
+> ```
 
 ### Configuration
 
@@ -119,6 +129,16 @@ For repo-local overrides on top of each user's normal Fence config, use:
 ```
 
 Use `fence --settings ./custom.json` to specify a different config.
+
+Inspect the active config without running a command:
+
+```bash
+fence config show
+fence config show --settings ./custom.json
+fence config show --template code
+```
+
+`fence config show` prints the config chain to `stderr` and the fully resolved config as plain JSON to `stdout`, so you can pipe the JSON to tools like `jq`.
 
 Create a starter config with sensible defaults:
 
