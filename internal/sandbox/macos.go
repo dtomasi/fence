@@ -181,7 +181,8 @@ func buildMachPermissionRule(operation, pattern string) string {
 	}
 	if strings.HasSuffix(pattern, "*") {
 		regex := "^" + regexp.QuoteMeta(strings.TrimSuffix(pattern, "*"))
-		return fmt.Sprintf("(allow %s (global-name-regex #%s))", operation, escapePath(regex))
+		regex = strings.ReplaceAll(regex, `"`, `\"`)
+		return fmt.Sprintf(`(allow %s (global-name-regex #"%s"))`, operation, regex)
 	}
 	return fmt.Sprintf("(allow %s (global-name %s))", operation, escapePath(pattern))
 }
