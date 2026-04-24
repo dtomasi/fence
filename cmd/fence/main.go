@@ -314,7 +314,7 @@ func runCommand(cmd *cobra.Command, args []string) error {
 		fencelog.Printf("[fence] Sandboxed command: %s\n", sandboxedCommand)
 	}
 
-	hardenedEnv := sandbox.GetHardenedEnv()
+	hardenedEnv := sandbox.GetHardenedEnvWithConfig(cfg)
 	if resolvedFenceLogFile != "" {
 		hardenedEnv = upsertEnv(hardenedEnv, fencelog.EnvVar, resolvedFenceLogFile)
 	}

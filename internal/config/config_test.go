@@ -1620,6 +1620,41 @@ func TestMatchesHost(t *testing.T) {
 	}
 }
 
+func TestMatchesEnvVar(t *testing.T) {
+	tests := []struct {
+		name    string
+		varName string
+		pattern string
+		want    bool
+	}{
+		// Exact matches
+		{"exact match", "PATH", "PATH", true},
+		{"exact no match", "HOME", "PATH", false},
+
+		// Wildcard matches
+		{"wildcard suffix", "AWS_ACCESS_KEY", "AWS_*", true},
+		{"wildcard suffix no match", "GCP_ACCESS_KEY", "AWS_*", false},
+		{"wildcard prefix", "MY_TOKEN", "*_TOKEN", true},
+		{"wildcard prefix no match", "MY_SECRET", "*_TOKEN", false},
+		{"wildcard middle", "MY_AWS_KEY", "MY_*_KEY", true},
+		{"wildcard middle no match", "MY_AWS_SECRET", "MY_*_KEY", false},
+		{"multiple wildcards", "MY_AWS_ACCESS_KEY", "MY_*_*_KEY", true},
+
+		// Star matches all
+		{"star matches all", "ANYTHING", "*", true},
+		{"star matches all empty", "", "*", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MatchesEnvVar(tt.varName, tt.pattern)
+			if got != tt.want {
+				t.Errorf("MatchesEnvVar(%q, %q) = %v, want %v", tt.varName, tt.pattern, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSSHConfigValidation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1673,6 +1708,62 @@ func TestSSHConfigValidation(t *testing.T) {
 				},
 			},
 			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Config.Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestEnvironmentConfigValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  Config
+		wantErr bool
+	}{
+		{
+			name: "valid environment config",
+			config: Config{
+				Environment: EnvironmentConfig{
+					AllowedVars: []string{"PATH", "HOME", "USER"},
+					DeniedVars:  []string{"*_TOKEN", "*_SECRET"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty allowed vars",
+			config: Config{
+				Environment: EnvironmentConfig{
+					AllowedVars: []string{""},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty denied vars",
+			config: Config{
+				Environment: EnvironmentConfig{
+					DeniedVars: []string{""},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid wildcard patterns",
+			config: Config{
+				Environment: EnvironmentConfig{
+					AllowedVars: []string{"*"},
+					DeniedVars:  []string{"AWS_*", "*_TOKEN"},
+				},
+			},
+			wantErr: false,
 		},
 	}
 
@@ -1832,6 +1923,67 @@ func TestMergeSSHConfig(t *testing.T) {
 		}
 		if !result.SSH.InheritDeny {
 			t.Error("expected InheritDeny to be true (OR logic)")
+		}
+	})
+}
+
+func TestMergeEnvironmentConfig(t *testing.T) {
+	t.Run("merge environment allowed vars", func(t *testing.T) {
+		base := &Config{
+			Environment: EnvironmentConfig{
+				AllowedVars: []string{"PATH", "HOME"},
+			},
+		}
+		override := &Config{
+			Environment: EnvironmentConfig{
+				AllowedVars: []string{"USER", "LANG"},
+			},
+		}
+		result := Merge(base, override)
+
+		if len(result.Environment.AllowedVars) != 4 {
+			t.Errorf("expected 4 allowed vars, got %d: %v", len(result.Environment.AllowedVars), result.Environment.AllowedVars)
+		}
+	})
+
+	t.Run("merge environment denied vars", func(t *testing.T) {
+		base := &Config{
+			Environment: EnvironmentConfig{
+				DeniedVars: []string{"*_TOKEN", "*_SECRET"},
+			},
+		}
+		override := &Config{
+			Environment: EnvironmentConfig{
+				DeniedVars: []string{"AWS_*", "GITHUB_*"},
+			},
+		}
+		result := Merge(base, override)
+
+		if len(result.Environment.DeniedVars) != 4 {
+			t.Errorf("expected 4 denied vars, got %d", len(result.Environment.DeniedVars))
+		}
+	})
+
+	t.Run("merge both allowed and denied vars", func(t *testing.T) {
+		base := &Config{
+			Environment: EnvironmentConfig{
+				AllowedVars: []string{"PATH"},
+				DeniedVars:  []string{"*_TOKEN"},
+			},
+		}
+		override := &Config{
+			Environment: EnvironmentConfig{
+				AllowedVars: []string{"HOME"},
+				DeniedVars:  []string{"*_SECRET"},
+			},
+		}
+		result := Merge(base, override)
+
+		if len(result.Environment.AllowedVars) != 2 {
+			t.Errorf("expected 2 allowed vars, got %d", len(result.Environment.AllowedVars))
+		}
+		if len(result.Environment.DeniedVars) != 2 {
+			t.Errorf("expected 2 denied vars, got %d", len(result.Environment.DeniedVars))
 		}
 	})
 }

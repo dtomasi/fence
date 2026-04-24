@@ -16,15 +16,16 @@ import (
 
 // Config is the main configuration for fence.
 type Config struct {
-	Extends         string           `json:"extends,omitempty" description:"Path or built-in template name to inherit base settings from (e.g. \"code\" or \"./base.json\"). Settings in this file are merged on top of the extended config."`
-	Network         NetworkConfig    `json:"network" description:"Network access restrictions. Controls which domains the sandbox may connect to and how local networking is handled."`
-	Filesystem      FilesystemConfig `json:"filesystem" description:"Filesystem access restrictions. Controls which paths may be read, written, or executed inside the sandbox."`
-	Devices         DevicesConfig    `json:"devices,omitempty"`
-	MacOS           MacOSConfig      `json:"macos,omitempty" description:"macOS-specific advanced sandbox controls. Ignored on non-macOS platforms."`
-	Command         CommandConfig    `json:"command" description:"Command execution restrictions. Controls which commands are blocked or allowed at preflight and runtime."`
-	SSH             SSHConfig        `json:"ssh" description:"SSH command and host restrictions. Applies only to ssh invocations; does not affect other network access."`
-	AllowPty        bool             `json:"allowPty,omitempty" description:"Allow the sandboxed process to allocate a pseudo-terminal (PTY). Required for interactive programs that need terminal control (e.g. vim, less, top)."`
-	ForceNewSession *bool            `json:"forceNewSession,omitempty"`
+	Extends         string            `json:"extends,omitempty" description:"Path or built-in template name to inherit base settings from (e.g. \"code\" or \"./base.json\"). Settings in this file are merged on top of the extended config."`
+	Network         NetworkConfig     `json:"network" description:"Network access restrictions. Controls which domains the sandbox may connect to and how local networking is handled."`
+	Filesystem      FilesystemConfig  `json:"filesystem" description:"Filesystem access restrictions. Controls which paths may be read, written, or executed inside the sandbox."`
+	Devices         DevicesConfig     `json:"devices,omitempty"`
+	MacOS           MacOSConfig       `json:"macos,omitempty" description:"macOS-specific advanced sandbox controls. Ignored on non-macOS platforms."`
+	Command         CommandConfig     `json:"command" description:"Command execution restrictions. Controls which commands are blocked or allowed at preflight and runtime."`
+	Environment     EnvironmentConfig `json:"environment,omitempty" description:"Environment variable restrictions. Controls which environment variables are passed through into the sandbox."`
+	SSH             SSHConfig         `json:"ssh" description:"SSH command and host restrictions. Applies only to ssh invocations; does not affect other network access."`
+	AllowPty        bool              `json:"allowPty,omitempty" description:"Allow the sandboxed process to allocate a pseudo-terminal (PTY). Required for interactive programs that need terminal control (e.g. vim, less, top)."`
+	ForceNewSession *bool             `json:"forceNewSession,omitempty"`
 }
 
 // NetworkConfig defines network restrictions.
@@ -111,6 +112,12 @@ type CommandConfig struct {
 	RuntimeExecPolicy                   RuntimeExecPolicy `json:"runtimeExecPolicy,omitempty" schema:"enum=path|argv" description:"Runtime child-process exec enforcement mode. \"path\" (default) uses executable-path masking for single-token denies. \"argv\" enables Linux-only argv-aware exec interception for child processes."`
 }
 
+// Environment defines environment variable restrictions.
+type EnvironmentConfig struct {
+	AllowedVars []string `json:"allowedVars,omitempty" description:"Environment variable names that are allowed to be passed through into the sandbox. If empty, no environment variables are passed through."`
+	DeniedVars  []string `json:"deniedVars,omitempty" description:"Environment variable names that are explicitly blocked from being passed through, even if they match allowedVars. Evaluated before allowedVars."`
+}
+
 // SSHConfig defines SSH command restrictions.
 // SSH commands are filtered using an allowlist by default for security.
 type SSHConfig struct {
@@ -184,6 +191,10 @@ func Default() *Config {
 			Deny:  []string{},
 			Allow: []string{},
 			// UseDefaults defaults to true (nil = true)
+		},
+		Environment: EnvironmentConfig{
+			AllowedVars: []string{},
+			DeniedVars:  []string{},
 		},
 		SSH: SSHConfig{
 			AllowedHosts:    []string{},
@@ -477,6 +488,14 @@ func (c *Config) Validate() error {
 		return errors.New("ssh.deniedCommands contains empty command")
 	}
 
+	// Environment config
+	if slices.Contains(c.Environment.AllowedVars, "") {
+		return errors.New("environment.allowedVars contains empty pattern")
+	}
+	if slices.Contains(c.Environment.DeniedVars, "") {
+		return errors.New("environment.deniedVars contains empty pattern")
+	}
+
 	return nil
 }
 
@@ -636,6 +655,24 @@ func MatchesHost(hostname, pattern string) bool {
 	return matchGlob(hostname, pattern)
 }
 
+// MatchesEnvVar checks if an environment variable name matches a pattern.
+// Environment variable patterns support wildcards anywhere in the pattern.
+func MatchesEnvVar(varName, pattern string) bool {
+	// "*" matches all variables
+	if pattern == "*" {
+		return true
+	}
+
+	// If pattern contains no wildcards, do exact match
+	if !strings.Contains(pattern, "*") {
+		return varName == pattern
+	}
+
+	// Convert glob pattern to a simple matcher
+	// Split pattern by * and check each part
+	return matchGlob(varName, pattern)
+}
+
 // matchGlob performs simple glob matching with * wildcards.
 func matchGlob(s, pattern string) bool {
 	// Handle edge cases
@@ -781,6 +818,12 @@ func Merge(base, override *Config) *Config {
 			// Boolean fields: true if either enables it
 			AllowAllCommands: base.SSH.AllowAllCommands || override.SSH.AllowAllCommands,
 			InheritDeny:      base.SSH.InheritDeny || override.SSH.InheritDeny,
+		},
+
+		Environment: EnvironmentConfig{
+			// Append slices
+			AllowedVars: mergeStrings(base.Environment.AllowedVars, override.Environment.AllowedVars),
+			DeniedVars:  mergeStrings(base.Environment.DeniedVars, override.Environment.DeniedVars),
 		},
 	}
 

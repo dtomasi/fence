@@ -4,6 +4,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/Use-Tusk/fence/internal/config"
 )
 
 // DangerousEnvPrefixes lists environment variable prefixes that can be used
@@ -59,13 +61,37 @@ func FilterDangerousEnv(env []string) []string {
 	return filtered
 }
 
+// FilterEnvironmentVars filters environment variables based on configuration.
+// Follows deny-before-allow precedence like other filtering in fence.
+// Returns original env if no config provided.
+func FilterEnvironmentVars(env []string, cfg *config.EnvironmentConfig) []string {
+	if cfg == nil || (len(cfg.DeniedVars) == 0 && len(cfg.AllowedVars) == 0) {
+		return env
+	}
+
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		varName := extractEnvVarName(entry)
+		if isEnvVarAllowed(varName, cfg) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+// extractEnvVarNameFromEntry extracts the variable name from an environment entry (KEY=VALUE).
+// This is a private helper function used by multiple functions to parse env entries.
+func extractEnvVarNameFromEntry(entry string) string {
+	if idx := strings.Index(entry, "="); idx != -1 {
+		return entry[:idx]
+	}
+	return entry
+}
+
 // isDangerousEnvVar checks if an environment variable entry (KEY=VALUE) is dangerous.
 func isDangerousEnvVar(entry string) bool {
-	// Split on first '=' to get the key
-	key := entry
-	if idx := strings.Index(entry, "="); idx != -1 {
-		key = entry[:idx]
-	}
+	// Extract the key from the entry
+	key := extractEnvVarNameFromEntry(entry)
 
 	// Check against known dangerous prefixes
 	for _, prefix := range DangerousEnvPrefixes {
@@ -90,15 +116,60 @@ func GetStrippedEnvVars(env []string) []string {
 	var stripped []string
 	for _, e := range env {
 		if isDangerousEnvVar(e) {
-			// Extract just the key
-			if idx := strings.Index(e, "="); idx != -1 {
-				stripped = append(stripped, e[:idx])
-			} else {
-				stripped = append(stripped, e)
-			}
+			// Extract just the key using the shared function
+			stripped = append(stripped, extractEnvVarNameFromEntry(e))
 		}
 	}
 	return stripped
+}
+
+// isEnvVarAllowed checks if an environment variable is allowed based on configuration.
+// Implements deny-before-allow precedence: denied patterns are checked first.
+func isEnvVarAllowed(varName string, cfg *config.EnvironmentConfig) bool {
+	// Check denied patterns first (deny takes precedence)
+	for _, pattern := range cfg.DeniedVars {
+		if config.MatchesEnvVar(varName, pattern) {
+			return false
+		}
+	}
+
+	// If no allow patterns configured, allow by default (after deny check)
+	if len(cfg.AllowedVars) == 0 {
+		return true
+	}
+
+	// Check allowed patterns
+	for _, pattern := range cfg.AllowedVars {
+		if config.MatchesEnvVar(varName, pattern) {
+			return true
+		}
+	}
+
+	return false // Not in allow list
+}
+
+// extractEnvVarName extracts the variable name from an environment entry (KEY=VALUE).
+// This is a public wrapper around extractEnvVarNameFromEntry for backward compatibility.
+func extractEnvVarName(entry string) string {
+	return extractEnvVarNameFromEntry(entry)
+}
+
+// GetHardenedEnvWithConfig returns environment with dangerous variables removed
+// and user-configured environment filtering applied.
+// First removes dangerous variables (mandatory security filtering),
+// then applies user-configured environment filtering.
+func GetHardenedEnvWithConfig(cfg *config.Config) []string {
+	env := os.Environ()
+
+	// First, remove dangerous variables (mandatory security filtering)
+	filtered := FilterDangerousEnv(env)
+
+	// Then apply user-configured environment filtering
+	if cfg != nil {
+		filtered = FilterEnvironmentVars(filtered, &cfg.Environment)
+	}
+
+	return filtered
 }
 
 // HardeningFeatures returns a description of environment sanitization applied on this platform.

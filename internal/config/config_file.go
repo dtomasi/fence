@@ -76,17 +76,24 @@ type cleanSSHConfig struct {
 	InheritDeny      bool     `json:"inheritDeny,omitempty"`
 }
 
+// cleanEnvironmentConfig is used for JSON output with omitempty to skip empty fields.
+type cleanEnvironmentConfig struct {
+	AllowedVars []string `json:"allowedVars,omitempty"`
+	DeniedVars  []string `json:"deniedVars,omitempty"`
+}
+
 // cleanConfig is used for JSON output with fields in desired order and omitempty.
 type cleanConfig struct {
-	Extends         string                 `json:"extends,omitempty"`
-	AllowPty        bool                   `json:"allowPty,omitempty"`
-	ForceNewSession *bool                  `json:"forceNewSession,omitempty"`
-	Network         *cleanNetworkConfig    `json:"network,omitempty"`
-	Filesystem      *cleanFilesystemConfig `json:"filesystem,omitempty"`
-	Devices         *cleanDevicesConfig    `json:"devices,omitempty"`
-	MacOS           *cleanMacOSConfig      `json:"macos,omitempty"`
-	Command         *cleanCommandConfig    `json:"command,omitempty"`
-	SSH             *cleanSSHConfig        `json:"ssh,omitempty"`
+	Extends         string                  `json:"extends,omitempty"`
+	AllowPty        bool                    `json:"allowPty,omitempty"`
+	ForceNewSession *bool                   `json:"forceNewSession,omitempty"`
+	Network         *cleanNetworkConfig     `json:"network,omitempty"`
+	Filesystem      *cleanFilesystemConfig  `json:"filesystem,omitempty"`
+	Devices         *cleanDevicesConfig     `json:"devices,omitempty"`
+	MacOS           *cleanMacOSConfig       `json:"macos,omitempty"`
+	Command         *cleanCommandConfig     `json:"command,omitempty"`
+	Environment     *cleanEnvironmentConfig `json:"environment,omitempty"`
+	SSH             *cleanSSHConfig         `json:"ssh,omitempty"`
 }
 
 // MarshalConfigJSON marshals a fence config to clean JSON, omitting empty arrays
@@ -162,6 +169,15 @@ func MarshalConfigJSON(cfg *Config) ([]byte, error) {
 		clean.Command = &command
 	}
 
+	// Environment config - only include if non-empty
+	environment := cleanEnvironmentConfig{
+		AllowedVars: cfg.Environment.AllowedVars,
+		DeniedVars:  cfg.Environment.DeniedVars,
+	}
+	if !isEnvironmentEmpty(environment) {
+		clean.Environment = &environment
+	}
+
 	// SSH config - only include if non-empty
 	ssh := cleanSSHConfig{
 		AllowedHosts:     cfg.SSH.AllowedHosts,
@@ -216,6 +232,10 @@ func isCommandEmpty(c cleanCommandConfig) bool {
 		c.UseDefaults == nil &&
 		len(c.AcceptSharedBinaryCannotRuntimeDeny) == 0 &&
 		c.RuntimeExecPolicy == ""
+}
+
+func isEnvironmentEmpty(e cleanEnvironmentConfig) bool {
+	return len(e.AllowedVars) == 0 && len(e.DeniedVars) == 0
 }
 
 func isSSHEmpty(s cleanSSHConfig) bool {

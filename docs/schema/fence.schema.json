@@ -75,6 +75,27 @@
       },
       "type": "object"
     },
+    "environment": {
+      "additionalProperties": false,
+      "description": "Environment variable restrictions. Controls which environment variables are passed through into the sandbox.",
+      "properties": {
+        "allowedVars": {
+          "description": "Environment variable names that are allowed to be passed through into the sandbox. If empty, no environment variables are passed through.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deniedVars": {
+          "description": "Environment variable names that are explicitly blocked from being passed through, even if they match allowedVars. Evaluated before allowedVars.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "extends": {
       "description": "Path or built-in template name to inherit base settings from (e.g. \"code\" or \"./base.json\"). Settings in this file are merged on top of the extended config.",
       "type": "string"

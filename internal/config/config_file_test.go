@@ -105,3 +105,34 @@ func TestMarshalConfigJSON_IncludesExtendedSections(t *testing.T) {
 	assert.Contains(t, output, `"ls"`)
 	assert.Contains(t, output, `"inheritDeny": true`)
 }
+
+func TestMarshalConfigJSON_IncludesEnvironmentConfig(t *testing.T) {
+	cfg := &Config{}
+	cfg.Environment.AllowedVars = []string{"PATH", "HOME", "USER"}
+	cfg.Environment.DeniedVars = []string{"*_TOKEN", "*_SECRET", "AWS_*"}
+
+	data, err := MarshalConfigJSON(cfg)
+	require.NoError(t, err)
+
+	output := string(data)
+	assert.Contains(t, output, `"environment": {`)
+	assert.Contains(t, output, `"allowedVars": [`)
+	assert.Contains(t, output, `"PATH"`)
+	assert.Contains(t, output, `"HOME"`)
+	assert.Contains(t, output, `"USER"`)
+	assert.Contains(t, output, `"deniedVars": [`)
+	assert.Contains(t, output, `"*_TOKEN"`)
+	assert.Contains(t, output, `"*_SECRET"`)
+	assert.Contains(t, output, `"AWS_*"`)
+}
+
+func TestMarshalConfigJSON_OmitsEmptyEnvironmentConfig(t *testing.T) {
+	cfg := &Config{}
+	// Don't set any environment config
+
+	data, err := MarshalConfigJSON(cfg)
+	require.NoError(t, err)
+
+	output := string(data)
+	assert.NotContains(t, output, `"environment"`)
+}
