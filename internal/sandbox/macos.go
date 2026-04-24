@@ -649,7 +649,7 @@ func GenerateSandboxProfile(params MacOSSandboxParams) string {
 }
 
 // WrapCommandMacOS wraps a command with macOS sandbox restrictions.
-func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, httpPort, socksPort int, exposedPorts []int, debug bool, shellMode string, shellLogin bool) (string, error) {
+func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, httpPort, socksPort int, exposedPorts []int, exposedHostPaths []exposedHostPath, debug bool, shellMode string, shellLogin bool) (string, error) {
 	// In wildcard mode ("*"), still run the proxy for apps that respect
 	// HTTP_PROXY, but allow direct connections for apps that don't.
 	hasWildcardAllow := hasWildcardAllowedDomain(cfg)
@@ -658,6 +658,35 @@ func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, htt
 
 	// Build allow paths: default + configured
 	allowPaths := append(GetDefaultWritePaths(), cfg.Filesystem.AllowWrite...)
+
+	// Fold caller-registered host-exposed paths into the seatbelt allowlist.
+	// On macOS the sandbox does not overmount any host path, so simply
+	// granting read (or read+write) access to the allowlist is sufficient.
+	//
+	// Important: writable exposures must ALSO appear in the read allowlist.
+	// In defaultDenyRead mode seatbelt's file-read-data and file-write*
+	// operation classes are disjoint - a (allow file-write* …) rule does
+	// NOT imply (allow file-read-data …), so a writable-only path would be
+	// open(O_RDWR)-but-unreadable. This also matches the Linux half of the
+	// API where --bind is inherently read+write.
+	//
+	// Existence is validated at wrap time rather than at ExposeHostPath
+	// registration (TOCTOU: the path might exist at registration but be
+	// deleted before sandbox launch). Missing paths are surfaced as a
+	// warning unconditionally - silently dropping them would cause a
+	// confusing downstream failure when the sandboxed process can't find
+	// the file.
+	readExposed := append([]string{}, cfg.Filesystem.AllowRead...)
+	for _, ehp := range exposedHostPaths {
+		if !fileExists(ehp.path) {
+			fencelog.Printf("[fence:macos] ExposeHostPath: skipping %q (does not exist on host at sandbox-launch time)\n", ehp.path)
+			continue
+		}
+		readExposed = append(readExposed, ehp.path)
+		if ehp.writable {
+			allowPaths = append(allowPaths, ehp.path)
+		}
+	}
 
 	// Expand /tmp <-> /private/tmp for macOS symlink compatibility
 	allowPaths = expandMacOSTmpPaths(allowPaths)
@@ -712,7 +741,7 @@ func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, htt
 		MachRegister:            cfg.MacOS.Mach.Register,
 		DefaultDenyRead:         cfg.Filesystem.DefaultDenyRead,
 		StrictDenyRead:          cfg.Filesystem.StrictDenyRead,
-		ReadAllowPaths:          cfg.Filesystem.AllowRead,
+		ReadAllowPaths:          readExposed,
 		ReadDenyPaths:           cfg.Filesystem.DenyRead,
 		WriteAllowPaths:         allowPaths,
 		WriteDenyPaths:          cfg.Filesystem.DenyWrite,
@@ -723,6 +752,11 @@ func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, htt
 
 	if debug && len(exposedPorts) > 0 {
 		fencelog.Printf("[fence:macos] Enabling local binding for exposed ports: %v\n", exposedPorts)
+	}
+	if debug && len(exposedHostPaths) > 0 {
+		for _, ehp := range exposedHostPaths {
+			fencelog.Printf("[fence:macos] ExposeHostPath: %s (writable=%v)\n", ehp.path, ehp.writable)
+		}
 	}
 	if debug && allowLocalBinding && !allowLocalOutbound {
 		fencelog.Printf("[fence:macos] Blocking localhost outbound (AllowLocalOutbound=false)\n")
